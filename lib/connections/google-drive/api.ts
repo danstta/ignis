@@ -1,0 +1,362 @@
+import { createHmac, timingSafeEqual } from "crypto";
+import { ensureFreshToken } from "@/lib/connections/oauth";
+import { publicAppUrl, sessionSecret } from "@/lib/env";
+
+const DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files";
+const DRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files";
+const DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder";
+
+export interface GoogleDriveImageFile {
+  id: string;
+  name: string;
+  mimeType: string;
+  url: string;
+  webViewLink: string;
+  webContentLink?: string;
+  thumbnailLink?: string;
+  directLink: string;
+  widthPx?: number;
+  heightPx?: number;
+}
+
+export interface GoogleDriveUploadedFile {
+  id: string;
+  name: string;
+  mimeType: string;
+  webViewLink: string;
+  webContentLink?: string;
+}
+
+interface DriveFileResponse {
+  id?: string;
+  name?: string;
+  mimeType?: string;
+  webViewLink?: string;
+  webContentLink?: string;
+  thumbnailLink?: string;
+  imageMediaMetadata?: {
+    width?: number;
+    height?: number;
+  };
+}
+
+interface DriveErrorResponse {
+  error?: {
+    message?: string;
+  };
+}
+
+interface DriveListResponse {
+  nextPageToken?: string;
+  files?: DriveFileResponse[];
+  error?: {
+    message?: string;
+  };
+}
+
+function driveViewLink(fileId: string): string {
+  return `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view`;
+}
+
+function driveDirectLink(fileId: string): string {
+  return `https://drive.google.com/uc?export=view&id=${encodeURIComponent(fileId)}`;
+}
+
+function googleDriveImageSignature(connectionId: string, fileId: string): string {
+  return createHmac("sha256", sessionSecret())
+    .update(`${connectionId}:${fileId}`)
+    .digest("base64url");
+}
+
+function proxyBaseUrl(): string {
+  return (
+    publicAppUrl() ??
+    (process.env.NODE_ENV === "production" ? "" : "http://localhost:3000")
+  );
+}
+
+export function verifyGoogleDriveImageSignature(input: {
+  connectionId: string;
+  fileId: string;
+  signature: string;
+}): boolean {
+  const expected = Buffer.from(
+    googleDriveImageSignature(input.connectionId, input.fileId),
+  );
+  const actual = Buffer.from(input.signature);
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+export function signedGoogleDriveImageUrl(input: {
+  connectionId: string;
+  fileId: string;
+}): string {
+  const path = `/api/drive-images/${encodeURIComponent(input.fileId)}`;
+  const params = new URLSearchParams({
+    connectionId: input.connectionId,
+    sig: googleDriveImageSignature(input.connectionId, input.fileId),
+  });
+  return `${proxyBaseUrl()}${path}?${params.toString()}`;
+}
+
+function escapeDriveQueryValue(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+function multipartRelatedBody(input: {
+  metadata: Record<string, unknown>;
+  bytes: Uint8Array;
+  mimeType: string;
+}): { body: Blob; contentType: string } {
+  const boundary = `ignis-${crypto.randomUUID()}`;
+  const contentType = `multipart/related; boundary=${boundary}`;
+  const metadata = JSON.stringify(input.metadata);
+  const bytes = Uint8Array.from(input.bytes);
+  const body = new Blob(
+    [
+      `--${boundary}\r\n`,
+      "Content-Type: application/json; charset=UTF-8\r\n\r\n",
+      metadata,
+      "\r\n",
+      `--${boundary}\r\n`,
+      `Content-Type: ${input.mimeType}\r\n\r\n`,
+      bytes.buffer,
+      "\r\n",
+      `--${boundary}--\r\n`,
+    ],
+    { type: contentType },
+  );
+
+  return { body, contentType };
+}
+
+export function parseGoogleDriveFolderId(input: string): string {
+  const value = input.trim();
+  if (!value) return "";
+
+  try {
+    const url = new URL(value);
+    const folderMatch = url.pathname.match(/\/folders\/([^/?#]+)/);
+    if (folderMatch?.[1]) return decodeURIComponent(folderMatch[1]);
+
+    const id = url.searchParams.get("id");
+    if (id) return id.trim();
+  } catch {
+    // Treat plain input as the folder ID.
+  }
+
+  return value;
+}
+
+function toImageFile(
+  file: DriveFileResponse,
+  connectionId: string,
+): GoogleDriveImageFile | undefined {
+  if (!file.id || !file.mimeType?.startsWith("image/")) return undefined;
+  return {
+    id: file.id,
+    name: file.name ?? file.id,
+    mimeType: file.mimeType,
+    url: signedGoogleDriveImageUrl({ connectionId, fileId: file.id }),
+    webViewLink: file.webViewLink ?? driveViewLink(file.id),
+    webContentLink: file.webContentLink,
+    thumbnailLink: file.thumbnailLink,
+    directLink: driveDirectLink(file.id),
+    widthPx: file.imageMediaMetadata?.width,
+    heightPx: file.imageMediaMetadata?.height,
+  };
+}
+
+function isDriveFolder(file: DriveFileResponse): file is DriveFileResponse & { id: string } {
+  return file.mimeType === DRIVE_FOLDER_MIME && Boolean(file.id);
+}
+
+async function listGoogleDriveFolderChildren(input: {
+  connectionId: string;
+  token: string;
+  folderId: string;
+  maxImages: number;
+  images: GoogleDriveImageFile[];
+}): Promise<string[]> {
+  const q = [
+    `'${escapeDriveQueryValue(input.folderId)}' in parents`,
+    "trashed = false",
+    `(mimeType = '${DRIVE_FOLDER_MIME}' or mimeType contains 'image/')`,
+  ].join(" and ");
+
+  const childFolderIds: string[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const url = new URL(DRIVE_FILES_URL);
+    url.searchParams.set("q", q);
+    url.searchParams.set("pageSize", "1000");
+    url.searchParams.set("spaces", "drive");
+    url.searchParams.set("supportsAllDrives", "true");
+    url.searchParams.set("includeItemsFromAllDrives", "true");
+    url.searchParams.set(
+      "fields",
+      [
+        "nextPageToken",
+        "files(id,name,mimeType,webViewLink,webContentLink,thumbnailLink,imageMediaMetadata(width,height))",
+      ].join(","),
+    );
+    url.searchParams.set("orderBy", "name_natural");
+    if (pageToken) url.searchParams.set("pageToken", pageToken);
+
+    const res = await fetch(url, {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${input.token}`,
+      },
+    });
+    const body = (await res.json().catch(() => null)) as DriveListResponse | null;
+    if (!res.ok) {
+      throw new Error(
+        `Google Drive list failed (${res.status}): ${
+          body?.error?.message ?? res.statusText
+        }`,
+      );
+    }
+
+    for (const file of body?.files ?? []) {
+      if (isDriveFolder(file)) {
+        childFolderIds.push(file.id);
+        continue;
+      }
+
+      const image = toImageFile(file, input.connectionId);
+      if (!image) continue;
+      input.images.push(image);
+      if (input.images.length >= input.maxImages) break;
+    }
+
+    pageToken = input.images.length < input.maxImages ? body?.nextPageToken : undefined;
+  } while (pageToken);
+
+  return childFolderIds;
+}
+
+export async function listGoogleDriveFolderImages(input: {
+  connectionId: string;
+  folder: string;
+  maxImages: number;
+}): Promise<GoogleDriveImageFile[]> {
+  const folderId = parseGoogleDriveFolderId(input.folder);
+  if (!folderId) throw new Error("Google Drive folder link or ID is required");
+
+  const token = await ensureFreshToken(input.connectionId);
+  const maxImages = Math.max(1, Math.trunc(input.maxImages));
+  const images: GoogleDriveImageFile[] = [];
+  const folderQueue = [folderId];
+  const visitedFolderIds = new Set<string>();
+  let folderIndex = 0;
+
+  while (folderIndex < folderQueue.length && images.length < maxImages) {
+    const currentFolderId = folderQueue[folderIndex++];
+    if (!currentFolderId || visitedFolderIds.has(currentFolderId)) continue;
+    visitedFolderIds.add(currentFolderId);
+
+    const childFolderIds = await listGoogleDriveFolderChildren({
+      token,
+      connectionId: input.connectionId,
+      folderId: currentFolderId,
+      maxImages,
+      images,
+    });
+
+    for (const childFolderId of childFolderIds) {
+      if (!visitedFolderIds.has(childFolderId)) folderQueue.push(childFolderId);
+    }
+  }
+
+  return images;
+}
+
+export async function fetchGoogleDriveImageFile(input: {
+  connectionId: string;
+  fileId: string;
+}): Promise<{ bytes: ArrayBuffer; contentType: string }> {
+  const token = await ensureFreshToken(input.connectionId);
+  const url = new URL(
+    `${DRIVE_FILES_URL}/${encodeURIComponent(input.fileId)}`,
+  );
+  url.searchParams.set("alt", "media");
+  url.searchParams.set("supportsAllDrives", "true");
+
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  if (!res.ok) {
+    const message = await res.text().catch(() => res.statusText);
+    throw new Error(`Google Drive image fetch failed (${res.status}): ${message}`);
+  }
+
+  return {
+    bytes: await res.arrayBuffer(),
+    contentType: res.headers.get("content-type") ?? "image/jpeg",
+  };
+}
+
+export async function uploadGoogleDriveFile(input: {
+  connectionId: string;
+  folder: string;
+  name: string;
+  mimeType: string;
+  bytes: Uint8Array;
+}): Promise<GoogleDriveUploadedFile> {
+  const folderId = parseGoogleDriveFolderId(input.folder);
+  if (!folderId) throw new Error("Google Drive folder link or ID is required");
+
+  const token = await ensureFreshToken(input.connectionId);
+  const url = new URL(DRIVE_UPLOAD_URL);
+  url.searchParams.set("uploadType", "multipart");
+  url.searchParams.set("supportsAllDrives", "true");
+  url.searchParams.set(
+    "fields",
+    "id,name,mimeType,webViewLink,webContentLink",
+  );
+
+  const { body, contentType } = multipartRelatedBody({
+    metadata: {
+      name: input.name,
+      parents: [folderId],
+    },
+    bytes: input.bytes,
+    mimeType: input.mimeType,
+  });
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": contentType,
+    },
+    body,
+  });
+  const responseBody = (await res.json().catch(() => null)) as
+    | (DriveFileResponse & DriveErrorResponse)
+    | null;
+
+  if (!res.ok) {
+    throw new Error(
+      `Google Drive upload failed (${res.status}): ${
+        responseBody?.error?.message ?? res.statusText
+      }`,
+    );
+  }
+
+  if (!responseBody?.id) {
+    throw new Error("Google Drive upload response did not include a file ID");
+  }
+
+  return {
+    id: responseBody.id,
+    name: responseBody.name ?? input.name,
+    mimeType: responseBody.mimeType ?? input.mimeType,
+    webViewLink: responseBody.webViewLink ?? driveViewLink(responseBody.id),
+    webContentLink: responseBody.webContentLink,
+  };
+}
